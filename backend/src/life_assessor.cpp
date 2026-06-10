@@ -1,10 +1,105 @@
 #include "life_assessor.h"
 #include <algorithm>
 #include <cmath>
-#include <deque>
 #include <numeric>
 
 namespace turbine_monitor {
+
+StreamingRainflowCounter::StreamingRainflowCounter(size_t maxResiduals)
+    : maxResiduals_(maxResiduals), totalCycles_(0) {}
+
+void StreamingRainflowCounter::addPoint(float stress) {
+    residual_.push_back(stress);
+    processResidual();
+
+    if (residual_.size() > maxResiduals_) {
+        if (residual_.size() >= 2) {
+            float s1 = residual_[0];
+            float s2 = residual_[1];
+            float range = std::abs(s2 - s1);
+            float mean = (s1 + s2) / 2.0f;
+            if (range > 0) {
+                mergeCycle(range, mean);
+                totalCycles_++;
+            }
+        }
+        residual_.pop_front();
+    }
+}
+
+void StreamingRainflowCounter::addPoints(const std::vector<float>& stresses) {
+    for (float s : stresses) {
+        addPoint(s);
+    }
+}
+
+void StreamingRainflowCounter::processResidual() {
+    while (residual_.size() >= 4) {
+        size_t n = residual_.size();
+        float s0 = residual_[n - 4];
+        float s1 = residual_[n - 3];
+        float s2 = residual_[n - 2];
+        float s3 = residual_[n - 1];
+
+        float rangeInner = std::abs(s1 - s2);
+        float rangeLeft  = std::abs(s0 - s1);
+        float rangeRight = std::abs(s2 - s3);
+
+        if (rangeInner <= rangeLeft && rangeInner <= rangeRight) {
+            float mean = (s1 + s2) / 2.0f;
+            float range = rangeInner;
+
+            mergeCycle(range, mean);
+            totalCycles_++;
+
+            residual_.erase(residual_.end() - 3, residual_.end() - 1);
+        } else {
+            break;
+        }
+    }
+}
+
+void StreamingRainflowCounter::mergeCycle(float range, float mean) {
+    for (auto& cycle : completedCycles_) {
+        if (std::abs(cycle.range - range) < 0.5f &&
+            std::abs(cycle.mean - mean) < 1.0f) {
+            cycle.count++;
+            return;
+        }
+    }
+    completedCycles_.push_back({range, mean, 1});
+}
+
+std::vector<RainflowCycle> StreamingRainflowCounter::getCycles() const {
+    return completedCycles_;
+}
+
+void StreamingRainflowCounter::getCyclesInto(std::vector<RainflowCycle>& out) const {
+    out = completedCycles_;
+}
+
+float StreamingRainflowCounter::getTotalDamage(float k, float m, float ultimateStrength) const {
+    float damage = 0.0f;
+    for (const auto& cycle : completedCycles_) {
+        float correctedRange = cycle.range;
+        if (cycle.mean > 0 && ultimateStrength > cycle.mean) {
+            correctedRange = cycle.range * ultimateStrength / (ultimateStrength - cycle.mean);
+        }
+        if (correctedRange <= 0) continue;
+
+        float cyclesToFailure = k * std::pow(correctedRange, -m);
+        if (cyclesToFailure > 0) {
+            damage += (1.0f / cyclesToFailure) * cycle.count;
+        }
+    }
+    return damage;
+}
+
+void StreamingRainflowCounter::reset() {
+    residual_.clear();
+    completedCycles_.clear();
+    totalCycles_ = 0;
+}
 
 LifeAssessor::LifeAssessor()
     : expectedLifeHours_(200000.0f) {
@@ -20,6 +115,14 @@ LifeAssessor::LifeAssessor()
     cumulativeDamage_.resize(TURBINE_COUNT + 1);
     for (auto& blades : cumulativeDamage_) {
         blades.resize(BLADE_COUNT + 1, 0.0f);
+    }
+
+    streamCounters_.resize(TURBINE_COUNT + 1);
+    for (auto& turbineCounters : streamCounters_) {
+        turbineCounters.resize(BLADE_COUNT + 1);
+        for (auto& counter : turbineCounters) {
+            counter = std::make_unique<StreamingRainflowCounter>(64);
+        }
     }
 }
 
@@ -48,6 +151,7 @@ void LifeAssessor::resetCumulativeDamage(uint8_t turbineId, uint8_t bladeId) {
     if (turbineId > 0 && turbineId <= TURBINE_COUNT &&
         bladeId > 0 && bladeId <= BLADE_COUNT) {
         cumulativeDamage_[turbineId][bladeId] = 0.0f;
+        streamCounters_[turbineId][bladeId]->reset();
     }
 }
 
@@ -87,84 +191,12 @@ std::vector<float> LifeAssessor::buildStressTimeHistory(
 std::vector<RainflowCycle> LifeAssessor::rainflowCounting(
     const std::vector<float>& stressTimeHistory) {
 
-    std::vector<RainflowCycle> cycles;
-    if (stressTimeHistory.size() < 3) return cycles;
+    StreamingRainflowCounter counter(64);
+    counter.addPoints(stressTimeHistory);
 
-    std::deque<float> points;
-    for (float s : stressTimeHistory) {
-        points.push_back(s);
-    }
+    auto cycles = counter.getCycles();
 
-    std::deque<float> stack;
-    size_t i = 0;
-
-    while (i < points.size()) {
-        stack.push_back(points[i]);
-
-        while (stack.size() >= 4) {
-            size_t n = stack.size();
-            float s0 = stack[n - 4];
-            float s1 = stack[n - 3];
-            float s2 = stack[n - 2];
-            float s3 = stack[n - 1];
-
-            float range1 = std::abs(s1 - s2);
-            float range2 = std::abs(s0 - s1);
-            float range3 = std::abs(s2 - s3);
-
-            if (range1 <= range2 && range1 <= range3) {
-                float mean = (s1 + s2) / 2.0f;
-                float range = std::abs(s2 - s1);
-
-                bool found = false;
-                for (auto& cycle : cycles) {
-                    if (std::abs(cycle.range - range) < 1e-6 &&
-                        std::abs(cycle.mean - mean) < 1e-6) {
-                        cycle.count++;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    cycles.push_back({range, mean, 1});
-                }
-
-                float s_removed = s1;
-                stack.erase(stack.end() - 3, stack.end() - 1);
-
-                if (!stack.empty() && std::abs(stack.back() - s_removed) < 1e-6) {
-                    stack.pop_back();
-                }
-            } else {
-                break;
-            }
-        }
-        i++;
-    }
-
-    while (stack.size() >= 2) {
-        float s1 = stack[0];
-        float s2 = stack[1];
-        float mean = (s1 + s2) / 2.0f;
-        float range = std::abs(s2 - s1);
-
-        if (range > 0) {
-            bool found = false;
-            for (auto& cycle : cycles) {
-                if (std::abs(cycle.range - range) < 1e-6 &&
-                    std::abs(cycle.mean - mean) < 1e-6) {
-                    cycle.count++;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                cycles.push_back({range, mean, 1});
-            }
-        }
-        stack.pop_front();
-    }
-
+    const auto& residual = counter.residualCount();
     return cycles;
 }
 
@@ -282,22 +314,36 @@ BladeStress LifeAssessor::computeStress(
     stress.vibration_stress = vibrationRms * sensitivity * amplificationFactor;
     stress.cavitation_stress = cavitationIntensity * 100.0f;
 
-    auto cycles = rainflowCounting(stressHistory);
-    stress.stress_cycles = 0;
-    for (const auto& c : cycles) {
-        stress.stress_cycles += c.count;
-    }
+    if (turbineId > 0 && turbineId <= TURBINE_COUNT &&
+        bladeId > 0 && bladeId <= BLADE_COUNT) {
+        auto& counter = streamCounters_[turbineId][bladeId];
+        counter->addPoints(stressHistory);
 
-    stress.rainflow_cycles.clear();
-    for (const auto& c : cycles) {
-        stress.rainflow_cycles.push_back(c.range);
-        stress.rainflow_cycles.push_back(c.mean);
-        stress.rainflow_cycles.push_back(static_cast<float>(c.count));
-    }
+        auto cycles = counter->getCycles();
+        stress.stress_cycles = 0;
+        for (const auto& c : cycles) {
+            stress.stress_cycles += c.count;
+        }
 
-    stressHistory_.push_back(stressHistory);
-    if (stressHistory_.size() > 100) {
-        stressHistory_.pop_front();
+        stress.rainflow_cycles.clear();
+        for (const auto& c : cycles) {
+            stress.rainflow_cycles.push_back(c.range);
+            stress.rainflow_cycles.push_back(c.mean);
+            stress.rainflow_cycles.push_back(static_cast<float>(c.count));
+        }
+    } else {
+        auto cycles = rainflowCounting(stressHistory);
+        stress.stress_cycles = 0;
+        for (const auto& c : cycles) {
+            stress.stress_cycles += c.count;
+        }
+
+        stress.rainflow_cycles.clear();
+        for (const auto& c : cycles) {
+            stress.rainflow_cycles.push_back(c.range);
+            stress.rainflow_cycles.push_back(c.mean);
+            stress.rainflow_cycles.push_back(static_cast<float>(c.count));
+        }
     }
 
     return stress;
@@ -316,7 +362,7 @@ LifeAssessment LifeAssessor::assessLife(
     assessment.timestamp = currentTimestampMs();
     assessment.turbine_id = turbineId;
     assessment.blade_id = bladeId;
-    assessment.assessment_method = "Rainflow + Miner Linear Damage";
+    assessment.assessment_method = "Streaming Rainflow + Miner Linear Damage";
     assessment.material_constant_k = materialProps_.k;
     assessment.material_constant_m = materialProps_.m;
 
@@ -335,12 +381,15 @@ LifeAssessment LifeAssessor::assessLife(
         });
     }
 
-    float fatigueDamage = minerSum(
-        cycles,
-        materialProps_.k,
-        materialProps_.m,
-        materialProps_.ultimateTensileStrength
-    );
+    float fatigueDamage = 0.0f;
+    if (turbineId > 0 && turbineId <= TURBINE_COUNT &&
+        bladeId > 0 && bladeId <= BLADE_COUNT) {
+        fatigueDamage = streamCounters_[turbineId][bladeId]->getTotalDamage(
+            materialProps_.k, materialProps_.m, materialProps_.ultimateTensileStrength);
+    } else {
+        fatigueDamage = minerSum(
+            cycles, materialProps_.k, materialProps_.m, materialProps_.ultimateTensileStrength);
+    }
 
     float cavitationDamage = cavitationState.cavitation_intensity * 0.001f;
 
@@ -355,16 +404,9 @@ LifeAssessment LifeAssessor::assessLife(
     assessment.cycle_count = stressData.stress_cycles;
 
     float damageRate = estimateDamageRate(
-        cycles,
-        materialProps_.k,
-        materialProps_.m,
-        materialProps_.ultimateTensileStrength
-    );
+        cycles, materialProps_.k, materialProps_.m, materialProps_.ultimateTensileStrength);
 
-    assessment.remaining_life_hours = estimateRemainingLife(
-        cumulativeDamageRef,
-        damageRate
-    );
+    assessment.remaining_life_hours = estimateRemainingLife(cumulativeDamageRef, damageRate);
     assessment.remaining_life_days = assessment.remaining_life_hours / 24.0f;
 
     return assessment;

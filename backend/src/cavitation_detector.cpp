@@ -3,10 +3,188 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <numeric>
 #include <json/json.h>
-#include <iomanip>
 
 namespace turbine_monitor {
+
+void OperatingConditionNormalizer::updateStats(
+    std::vector<FeatureStats>& stats,
+    const std::vector<float>& features) {
+
+    if (stats.size() != features.size()) {
+        stats.resize(features.size());
+    }
+
+    for (size_t i = 0; i < features.size(); ++i) {
+        auto& s = stats[i];
+        float delta = features[i] - s.mean;
+        s.count++;
+        s.mean += delta / s.count;
+        float delta2 = features[i] - s.mean;
+        if (s.count > 1) {
+            float variance = s.stddev * s.stddev;
+            variance = (variance * (s.count - 2) + delta * delta2) / (s.count - 1);
+            s.stddev = std::sqrt(std::max(variance, MIN_STDDEV * MIN_STDDEV));
+        }
+    }
+}
+
+void OperatingConditionNormalizer::update(
+    const std::vector<float>& features,
+    const OperatingCondition& condition) {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint32_t key = condition.bucketKey();
+    updateStats(bucketStats_[key], features);
+}
+
+std::vector<float> OperatingConditionNormalizer::applyZScore(
+    const std::vector<float>& features,
+    const std::vector<FeatureStats>& stats) const {
+
+    std::vector<float> normalized(features.size());
+    for (size_t i = 0; i < features.size(); ++i) {
+        if (i < stats.size() && stats[i].count >= MIN_SAMPLES_FOR_STATS) {
+            normalized[i] = (features[i] - stats[i].mean) / stats[i].stddev;
+        } else {
+            if (features[i] != 0.0f) {
+                float absVal = std::abs(features[i]);
+                normalized[i] = features[i] / (absVal + 1.0f);
+            } else {
+                normalized[i] = 0.0f;
+            }
+        }
+    }
+    return normalized;
+}
+
+std::vector<float> OperatingConditionNormalizer::normalize(
+    const std::vector<float>& features,
+    const OperatingCondition& condition) const {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint32_t key = condition.bucketKey();
+    auto it = bucketStats_.find(key);
+    if (it != bucketStats_.end()) {
+        return applyZScore(features, it->second);
+    }
+
+    std::vector<float> normalized(features.size());
+    for (size_t i = 0; i < features.size(); ++i) {
+        float absVal = std::abs(features[i]);
+        normalized[i] = absVal > 0 ? features[i] / (absVal + 1.0f) : 0.0f;
+    }
+    return normalized;
+}
+
+AdaptiveThreshold::AdaptiveThreshold(float baseIncipient, float baseCritical,
+                                     float baseDeveloped, float ewmaAlpha,
+                                     size_t windowSize)
+    : baseIncipient_(baseIncipient), baseCritical_(baseCritical),
+      baseDeveloped_(baseDeveloped), ewmaAlpha_(ewmaAlpha),
+      windowSize_(windowSize) {}
+
+uint32_t AdaptiveThreshold::stateKey(uint8_t turbineId,
+                                      const OperatingCondition& condition) const {
+    return static_cast<uint32_t>(turbineId) * 10000 + condition.bucketKey();
+}
+
+float AdaptiveThreshold::computePercentile(
+    const std::deque<float>& data,
+    float percentile) const {
+
+    if (data.empty()) return 0.0f;
+
+    std::vector<float> sorted(data.begin(), data.end());
+    std::sort(sorted.begin(), sorted.end());
+
+    size_t idx = static_cast<size_t>(percentile * (sorted.size() - 1));
+    return sorted[std::min(idx, sorted.size() - 1)];
+}
+
+void AdaptiveThreshold::update(float score, uint8_t turbineId,
+                                const OperatingCondition& condition) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint32_t key = stateKey(turbineId, condition);
+
+    auto& state = stateMap_[key];
+    state.updateCount++;
+
+    if (state.updateCount == 1) {
+        state.ewmaBaseline = score;
+        state.ewmaStd = 0.01f;
+        state.incipient = baseIncipient_;
+        state.critical = baseCritical_;
+        state.developed = baseDeveloped_;
+    } else {
+        float delta = score - state.ewmaBaseline;
+        state.ewmaBaseline += ewmaAlpha_ * delta;
+        float delta2 = score - state.ewmaBaseline;
+        state.ewmaStd = std::sqrt(
+            (1.0f - ewmaAlpha_) * state.ewmaStd * state.ewmaStd +
+            ewmaAlpha_ * delta2 * delta2
+        );
+        state.ewmaStd = std::max(state.ewmaStd, 0.01f);
+    }
+
+    state.recentScores.push_back(score);
+    if (state.recentScores.size() > windowSize_) {
+        state.recentScores.pop_front();
+    }
+
+    if (state.recentScores.size() >= 50) {
+        state.percentile95 = computePercentile(state.recentScores, 0.95f);
+        state.percentile99 = computePercentile(state.recentScores, 0.99f);
+
+        float dynamicIncipient = std::max(baseIncipient_ * 0.5f,
+            state.ewmaBaseline + 2.0f * state.ewmaStd);
+        float dynamicCritical = std::max(baseCritical_ * 0.5f,
+            state.ewmaBaseline + 3.0f * state.ewmaStd);
+        float dynamicDeveloped = std::max(baseDeveloped_ * 0.5f,
+            state.percentile95 + 1.0f * state.ewmaStd);
+
+        float blendFactor = std::min(1.0f, state.recentScores.size() / 500.0f);
+        state.incipient = (1.0f - blendFactor) * baseIncipient_ + blendFactor * dynamicIncipient;
+        state.critical = (1.0f - blendFactor) * baseCritical_ + blendFactor * dynamicCritical;
+        state.developed = (1.0f - blendFactor) * baseDeveloped_ + blendFactor * dynamicDeveloped;
+
+        if (state.incipient >= state.critical) {
+            state.critical = state.incipient + 0.1f;
+        }
+        if (state.critical >= state.developed) {
+            state.developed = state.critical + 0.1f;
+        }
+        state.developed = std::min(state.developed, 1.0f);
+    }
+}
+
+AdaptiveThreshold::ThresholdState AdaptiveThreshold::getThresholds(
+    uint8_t turbineId,
+    const OperatingCondition& condition) const {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint32_t key = stateKey(turbineId, condition);
+    auto it = stateMap_.find(key);
+    if (it != stateMap_.end()) {
+        return it->second;
+    }
+
+    ThresholdState state;
+    state.incipient = baseIncipient_;
+    state.critical = baseCritical_;
+    state.developed = baseDeveloped_;
+    return state;
+}
+
+CavitationStage AdaptiveThreshold::classify(float score, uint8_t turbineId,
+                                             const OperatingCondition& condition) const {
+    auto thresholds = getThresholds(turbineId, condition);
+    if (score >= thresholds.developed) return CavitationStage::DEVELOPED;
+    if (score >= thresholds.critical) return CavitationStage::CRITICAL;
+    if (score >= thresholds.incipient) return CavitationStage::INCIPIENT;
+    return CavitationStage::NORMAL;
+}
 
 IsolationForest::IsolationForest(int numTrees, int subSamplingSize)
     : numTrees_(numTrees), subSamplingSize_(subSamplingSize), rng_(std::random_device{}()) {
@@ -276,6 +454,10 @@ CavitationDetector::CavitationDetector(bool enableAutoEncoder,
     if (enableIsolationForest_) {
         isolationForest_ = std::make_unique<IsolationForest>();
     }
+
+    normalizer_ = std::make_unique<OperatingConditionNormalizer>();
+    adaptiveThreshold_ = std::make_unique<AdaptiveThreshold>(
+        incipientThreshold_, criticalThreshold_, developedThreshold_);
 }
 
 void CavitationDetector::setThresholds(float incipientThreshold, float criticalThreshold, float developedThreshold) {
@@ -329,29 +511,6 @@ std::vector<float> CavitationDetector::buildFeatureVector(
     return features;
 }
 
-void CavitationDetector::normalizeFeatures(std::vector<float>& features) {
-    float maxVal = 0.0f;
-    for (float f : features) {
-        maxVal = std::max(maxVal, std::abs(f));
-    }
-    if (maxVal > 0.0f) {
-        for (float& f : features) {
-            f /= maxVal;
-        }
-    }
-}
-
-CavitationStage CavitationDetector::classifyStage(float combinedScore) {
-    if (combinedScore >= developedThreshold_) {
-        return CavitationStage::DEVELOPED;
-    } else if (combinedScore >= criticalThreshold_) {
-        return CavitationStage::CRITICAL;
-    } else if (combinedScore >= incipientThreshold_) {
-        return CavitationStage::INCIPIENT;
-    }
-    return CavitationStage::NORMAL;
-}
-
 float CavitationDetector::computeCavitationIntensity(float combinedScore) {
     return std::min(1.0f, std::max(0.0f, combinedScore));
 }
@@ -359,17 +518,12 @@ float CavitationDetector::computeCavitationIntensity(float combinedScore) {
 float CavitationDetector::computeConfidence(float combinedScore, ModelType modelType) {
     float baseConfidence = 0.7f;
 
-    if (combinedScore < incipientThreshold_) {
-        baseConfidence += (1.0f - combinedScore / incipientThreshold_) * 0.2f;
-    } else if (combinedScore > developedThreshold_) {
-        baseConfidence += (combinedScore - developedThreshold_) / (1.0f - developedThreshold_) * 0.2f;
-    } else {
-        float distToBoundary = std::min(
-            std::abs(combinedScore - incipientThreshold_),
-            std::abs(combinedScore - criticalThreshold_)
-        );
-        baseConfidence += std::min(distToBoundary * 0.5f, 0.2f);
-    }
+    auto thresholds = adaptiveThreshold_->getThresholds(0, OperatingCondition());
+    float distToIncipient = std::abs(combinedScore - thresholds.incipient);
+    float distToCritical = std::abs(combinedScore - thresholds.critical);
+
+    float distToBoundary = std::min(distToIncipient, distToCritical);
+    baseConfidence += std::min(distToBoundary * 2.0f, 0.2f);
 
     if (modelType == ModelType::ENSEMBLE) {
         baseConfidence = std::min(1.0f, baseConfidence + 0.1f);
@@ -383,7 +537,8 @@ CavitationState CavitationDetector::detect(
     const WaveletFeatures& wavelet,
     uint64_t timestamp,
     uint8_t turbineId,
-    uint8_t bladeId) {
+    uint8_t bladeId,
+    const OperatingCondition& condition) {
 
     CavitationState state{};
     state.timestamp = timestamp;
@@ -391,8 +546,11 @@ CavitationState CavitationDetector::detect(
     state.blade_id = bladeId;
 
     auto features = buildFeatureVector(spectrum, wavelet);
-    normalizeFeatures(features);
-    state.feature_vector = features;
+
+    normalizer_->update(features, condition);
+    auto normalizedFeatures = normalizer_->normalize(features, condition);
+
+    state.feature_vector = normalizedFeatures;
 
     double aeScore = 0.0;
     double ifScore = 0.0;
@@ -400,7 +558,7 @@ CavitationState CavitationDetector::detect(
     int modelCount = 0;
 
     if (autoEncoder_) {
-        aeScore = autoEncoder_->reconstructionError(features);
+        aeScore = autoEncoder_->reconstructionError(normalizedFeatures);
         aeScore = std::min(1.0, aeScore * 2.0);
         state.reconstruction_error = static_cast<float>(aeScore);
         combinedScore += aeScore;
@@ -408,7 +566,7 @@ CavitationState CavitationDetector::detect(
     }
 
     if (isolationForest_) {
-        ifScore = isolationForest_->anomalyScore(features);
+        ifScore = isolationForest_->anomalyScore(normalizedFeatures);
         state.anomaly_score = static_cast<float>(ifScore);
         combinedScore += ifScore;
         modelCount++;
@@ -427,7 +585,11 @@ CavitationState CavitationDetector::detect(
     }
 
     state.cavitation_intensity = computeCavitationIntensity(static_cast<float>(combinedScore));
-    state.cavitation_stage = classifyStage(static_cast<float>(combinedScore));
+
+    adaptiveThreshold_->update(static_cast<float>(combinedScore), turbineId, condition);
+    state.cavitation_stage = adaptiveThreshold_->classify(
+        static_cast<float>(combinedScore), turbineId, condition);
+
     state.confidence = computeConfidence(static_cast<float>(combinedScore), state.model_type);
 
     return state;

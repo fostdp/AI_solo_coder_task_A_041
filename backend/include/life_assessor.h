@@ -22,6 +22,32 @@ struct MaterialProperties {
     float m;
 };
 
+class StreamingRainflowCounter {
+public:
+    StreamingRainflowCounter(size_t maxResiduals = 64);
+
+    void addPoint(float stress);
+    void addPoints(const std::vector<float>& stresses);
+
+    std::vector<RainflowCycle> getCycles() const;
+    void getCyclesInto(std::vector<RainflowCycle>& out) const;
+
+    float getTotalDamage(float k, float m, float ultimateStrength) const;
+    void reset();
+
+    size_t residualCount() const { return residual_.size(); }
+    size_t totalCyclesFound() const { return totalCycles_; }
+
+private:
+    std::deque<float> residual_;
+    size_t maxResiduals_;
+    std::vector<RainflowCycle> completedCycles_;
+    size_t totalCycles_;
+
+    void processResidual();
+    void mergeCycle(float range, float mean);
+};
+
 class LifeAssessor {
 public:
     LifeAssessor();
@@ -57,8 +83,8 @@ private:
     MaterialProperties materialProps_;
     float expectedLifeHours_;
 
-    std::deque<std::vector<float>> stressHistory_;
     std::vector<std::vector<float>> cumulativeDamage_;
+    std::vector<std::unique_ptr<StreamingRainflowCounter>> streamCounters_;
     mutable std::mutex mutex_;
 
     static std::vector<float> goodmanCorrection(const RainflowCycle& cycle, float ultimateStrength);
