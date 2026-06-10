@@ -1,0 +1,211 @@
+version: "3.9"
+
+x-cpp-common: &cpp-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.cpp
+  restart: unless-stopped
+  depends_on:
+    clickhouse:
+      condition: service_healthy
+  volumes:
+    - ../config:/opt/turbine/config:ro
+    - shm-data:/tmp/shm_turbine
+    - log-data:/var/log/turbine_monitor
+  networks:
+    - turbine-net
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+
+services:
+  # ======================== Infrastructure ========================
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1-alpine
+    container_name: turbine-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ../clickhouse/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ../clickhouse/archive_policy.sql:/docker-entrypoint-initdb.d/02_archive.sql:ro
+      - ch-data:/var/lib/clickhouse
+      - ch-logs:/var/log/clickhouse-server
+    environment:
+      CLICKHOUSE_DB: turbine_monitor
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - turbine-net
+
+  # ======================== C++ Microservices ========================
+
+  pxi_collector:
+    <<: *cpp-common
+    container_name: turbine-pxi-collector
+    command: /opt/turbine/bin/pxi_collector/pxi_collector -c /opt/turbine/config/config.json
+    ports:
+      - "9001:9000/udp"
+      - "9101:9100"
+    environment:
+      SERVICE_NAME: pxi_collector
+      CLICKHOUSE_HOST: clickhouse
+      UDP_PORT: "9000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  cavitation_detector:
+    <<: *cpp-common
+    container_name: turbine-cavitation-detector
+    command: /opt/turbine/bin/cavitation_detector/cavitation_detector -c /opt/turbine/config/config.json
+    ports:
+      - "9102:9100"
+    environment:
+      SERVICE_NAME: cavitation_detector
+
+  fatigue_evaluator:
+    <<: *cpp-common
+    container_name: turbine-fatigue-evaluator
+    command: /opt/turbine/bin/fatigue_evaluator/fatigue_evaluator -c /opt/turbine/config/config.json
+    ports:
+      - "9103:9100"
+    environment:
+      SERVICE_NAME: fatigue_evaluator
+
+  alarm_pusher:
+    <<: *cpp-common
+    container_name: turbine-alarm-pusher
+    command: /opt/turbine/bin/alarm_pusher/alarm_pusher -c /opt/turbine/config/config.json
+    ports:
+      - "9104:9100"
+    environment:
+      SERVICE_NAME: alarm_pusher
+      IEC61850_GATEWAY_HOST: iec61850_simulator
+      IEC61850_GATEWAY_PORT: "8102"
+
+  api_gateway:
+    <<: *cpp-common
+    container_name: turbine-api-gateway
+    command: /opt/turbine/bin/api_gateway/api_gateway -c /opt/turbine/config/config.json
+    ports:
+      - "8080:8080"
+      - "9105:9100"
+    environment:
+      SERVICE_NAME: api_gateway
+    depends_on:
+      - pxi_collector
+      - cavitation_detector
+      - fatigue_evaluator
+      - alarm_pusher
+
+  # ======================== Simulators ========================
+
+  pxi_simulator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pxi_sim
+    container_name: turbine-pxi-sim
+    restart: unless-stopped
+    command:
+      - "-H"
+      - "pxi_collector"
+      - "-p"
+      - "9000"
+      - "-i"
+      - "0.001"
+      - "--inject-cavitation"
+      - "2:developed,4:critical"
+    depends_on:
+      - pxi_collector
+    networks:
+      - turbine-net
+
+  iec61850_simulator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.iec61850
+    container_name: turbine-iec61850-sim
+    restart: unless-stopped
+    ports:
+      - "8102:8102"
+    networks:
+      - turbine-net
+
+  # ======================== Frontend ========================
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    container_name: turbine-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api_gateway
+    networks:
+      - turbine-net
+
+  # ======================== Monitoring ========================
+
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: turbine-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    networks:
+      - turbine-net
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: turbine-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - turbine-net
+
+# ======================== Volumes ========================
+
+volumes:
+  ch-data:
+  ch-logs:
+  shm-data:
+  log-data:
+  prom-data:
+  grafana-data:
+
+# ======================== Networks ========================
+
+networks:
+  turbine-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

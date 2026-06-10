@@ -27,17 +27,35 @@ find_library(CLICKHOUSE_LIBRARY NAMES clickhouse-cpp)
 
 find_path(JSON_INCLUDE_DIR nlohmann/json.hpp)
 
+find_package(spdlog QUIET)
+if(NOT spdlog_FOUND)
+    find_path(SPDLOG_INCLUDE_DIR spdlog/spdlog.h)
+    find_library(SPDLOG_LIBRARY NAMES spdlog)
+    if(SPDLOG_INCLUDE_DIR AND SPDLOG_LIBRARY)
+        message(STATUS "Found spdlog: ${SPDLOG_LIBRARY}")
+    else()
+        message(WARNING "spdlog not found - building without structured logging")
+    endif()
+endif()
+
+find_path(PROMETHEUS_INCLUDE_DIR prometheus/registry.h)
+find_library(PROMETHEUS_LIBRARY NAMES prometheus-cpp-pull prometheus-cpp-core)
+
 include_directories(
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/include
     ${FFTW3_INCLUDE_DIR}
     ${CLICKHOUSE_INCLUDE_DIR}
     ${JSON_INCLUDE_DIR}
+    ${SPDLOG_INCLUDE_DIR}
+    ${PROMETHEUS_INCLUDE_DIR}
 )
 
 set(THIRD_PARTY_LIBS
     ${FFTW3_LIBRARY}
     ${CLICKHOUSE_LIBRARY}
+    ${SPDLOG_LIBRARY}
+    ${PROMETHEUS_LIBRARY}
     Threads::Threads
 )
 

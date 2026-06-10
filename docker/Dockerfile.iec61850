@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /opt/iec61850
+
+RUN pip install --no-cache-dir flask
+
+COPY simulator/iec61850_simulator.py /opt/iec61850/
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8102
+ENTRYPOINT ["python", "/opt/iec61850/iec61850_simulator.py"]
+CMD ["--port", "8102"]

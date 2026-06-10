@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir numpy
+
+WORKDIR /opt/turbine
+COPY simulator/ /opt/turbine/simulator/
+COPY config/ /opt/turbine/config/
+
+ENV PYTHONUNBUFFERED=1
+ENTRYPOINT ["python", "/opt/turbine/simulator/pxi_simulator.py"]
+CMD ["-H", "pxi_collector", "-p", "9000", "-i", "0.001"]

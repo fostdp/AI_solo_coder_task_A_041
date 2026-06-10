@@ -412,6 +412,103 @@ class RegressionSuite:
         details = f"target {len(found)}/{len(required_targets)}, common静态库={'Y' if has_common else 'N'}"
         return (ok, details, {"targets_found": len(found), "common_lib": has_common})
 
+    # ========================================================
+    # T10: Docker编排文件完整性
+    # ========================================================
+    def test_docker_compose(self) -> Tuple[bool, str, Dict]:
+        """docker-compose.yml: 包含所有服务定义"""
+        compose = ROOT / "docker" / "docker-compose.yml"
+        if not compose.exists():
+            return (False, "docker-compose.yml not found", None)
+        text = compose.read_text(encoding="utf-8")
+        required = ["pxi_collector", "cavitation_detector", "fatigue_evaluator",
+                     "alarm_pusher", "api_gateway", "clickhouse", "pxi_simulator",
+                     "iec61850_simulator", "frontend", "prometheus", "grafana"]
+        found = [s for s in required if f"{s}:" in text or f"  {s}:" in text]
+        ok = len(found) >= len(required) - 1
+        details = f"{len(found)}/{len(required)} services defined"
+        return (ok, details, {"services": len(found)})
+
+    # ========================================================
+    # T11: Dockerfile存在性
+    # ========================================================
+    def test_dockerfiles(self) -> Tuple[bool, str, Dict]:
+        """Dockerfile: 4个构建文件存在"""
+        required = [
+            ROOT / "docker" / "Dockerfile.cpp",
+            ROOT / "docker" / "Dockerfile.pxi_sim",
+            ROOT / "docker" / "Dockerfile.iec61850",
+            ROOT / "docker" / "Dockerfile.frontend",
+        ]
+        found = sum(1 for f in required if f.exists())
+        ok = found == len(required)
+        details = f"{found}/{len(required)} Dockerfiles present"
+        return (ok, details, {"found": found})
+
+    # ========================================================
+    # T12: PXI模拟器空化注入
+    # ========================================================
+    def test_pxi_simulator_injection(self) -> Tuple[bool, str, Dict]:
+        """PXI模拟器: 支持--inject-cavitation参数"""
+        sim = ROOT / "simulator" / "pxi_simulator.py"
+        if not sim.exists():
+            return (False, "pxi_simulator.py not found", None)
+        text = sim.read_text(encoding="utf-8")
+        checks = [
+            ("CavitationSignalInjector" in text, "CavitationSignalInjector class"),
+            ("inject-cavitation" in text, "--inject-cavitation arg"),
+            ("CAVITATION_PROFILES" in text, "CAVITATION_PROFILES dict"),
+            ("CavitationStage" in text, "CavitationStage enum"),
+            ("impact_count" in text, "impact injection logic"),
+        ]
+        fails = [c[1] for c in checks if not c[0]]
+        ok = len(fails) == 0
+        details = f"{len(checks)-len(fails)}/{len(checks)} checks passed" + (
+            f" missing: {','.join(fails)}" if fails else "")
+        return (ok, details, {"checks_ok": len(checks)-len(fails)})
+
+    # ========================================================
+    # T13: Nginx Gzip配置
+    # ========================================================
+    def test_nginx_gzip(self) -> Tuple[bool, str, Dict]:
+        """nginx.conf: 启用gzip压缩"""
+        nginx = ROOT / "docker" / "nginx.conf"
+        if not nginx.exists():
+            return (False, "nginx.conf not found", None)
+        text = nginx.read_text(encoding="utf-8")
+        checks = [
+            ("gzip on" in text, "gzip enabled"),
+            ("gzip_types" in text, "gzip_types defined"),
+            ("gzip_comp_level" in text, "compression level set"),
+            ("proxy_pass http://api_gateway" in text, "api reverse proxy"),
+        ]
+        fails = [c[1] for c in checks if not c[0]]
+        ok = len(fails) == 0
+        details = f"{len(checks)-len(fails)}/{len(checks)} checks" + (
+            f" missing: {','.join(fails)}" if fails else "")
+        return (ok, details, {"checks_ok": len(checks)-len(fails)})
+
+    # ========================================================
+    # T14: ClickHouse归档策略
+    # ========================================================
+    def test_clickhouse_archive(self) -> Tuple[bool, str, Dict]:
+        """archive_policy.sql: TTL+归档物化视图"""
+        sql = ROOT / "clickhouse" / "archive_policy.sql"
+        if not sql.exists():
+            return (False, "archive_policy.sql not found", None)
+        text = sql.read_text(encoding="utf-8")
+        checks = [
+            ("TO VOLUME 'cold'" in text, "cold volume tiered storage"),
+            ("cavitation_intensity_1h" in text, "1h aggregation MV"),
+            ("blade_damage_daily" in text, "daily damage MV"),
+            ("alarm_stats_daily" in text, "alarm stats daily MV"),
+        ]
+        fails = [c[1] for c in checks if not c[0]]
+        ok = len(fails) == 0
+        details = f"{len(checks)-len(fails)}/{len(checks)} checks" + (
+            f" missing: {','.join(fails)}" if fails else "")
+        return (ok, details, {"checks_ok": len(checks)-len(fails)})
+
 
 # ============================================================
 # 入口
@@ -439,6 +536,12 @@ def main():
     suite.run("T7 前端拆分完整性 (2文件+类)", suite.test_frontend_split, timeout_s=3)
     suite.run("T8 微服务源码完整性 (5服务)", suite.test_services_sources, timeout_s=3)
     suite.run("T9 CMakeLists多target定义", suite.test_cmake_multitarget, timeout_s=3)
+    # Docker / 工程化
+    suite.run("T10 Docker Compose服务定义 (11服务)", suite.test_docker_compose, timeout_s=3)
+    suite.run("T11 Dockerfile完整性 (4文件)", suite.test_dockerfiles, timeout_s=3)
+    suite.run("T12 PXI模拟器空化注入功能", suite.test_pxi_simulator_injection, timeout_s=3)
+    suite.run("T13 Nginx Gzip压缩配置", suite.test_nginx_gzip, timeout_s=3)
+    suite.run("T14 ClickHouse归档策略SQL", suite.test_clickhouse_archive, timeout_s=3)
 
     ret = suite.summary()
 
