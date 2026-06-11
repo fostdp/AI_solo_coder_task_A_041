@@ -1,275 +1,366 @@
 # 大型水电站水轮机空化噪声监测与寿命评估系统
 
-## 项目概述
-
-本系统是一套完整的水轮机空化噪声监测与寿命评估全栈应用，专为大型水电站设计。系统通过布设的水听器和加速度计实时采集空化噪声和振动数据，基于先进的信号处理和机器学习算法实现空化状态在线识别与叶片疲劳寿命评估。
-
 ## 系统架构
 
 ```
-┌─────────────────┐     UDP     ┌─────────────────┐     HTTP      ┌─────────────────┐
-│  PXI 采集模拟器 │ ─────────→ │  C++ 后端服务   │ ─────────→  │  WebGL 前端      │
-│  (pxi_simulator)│  数据流    │  (数据处理)     │   REST API  │  (可视化监控)    │
-└─────────────────┘            └────────┬────────┘              └─────────────────┘
-                                        │
-                                        ▼
-                              ┌─────────────────┐
-                              │  ClickHouse DB  │
-                              │  (时序数据存储) │
-                              └─────────────────┘
+                            ┌──────────────────────────────────────────────┐
+                            │              Docker Compose 编排              │
+                            │                                              │
+┌─────────┐  UDP 1ms  ┌────┴─────┐  IPC  ┌────────────────┐  IPC  ┌─────┴──────┐
+│  PXI     │──────────→│ pxi_     │──RAW──→│ cavitation_    │──CAV──→│ fatigue_   │
+│  Sim     │  6×20pkt  │ collector│──FEAT─→│ detector       │       │ evaluator  │
+└─────────┘  /ms       └────┬─────┘       └───────┬────────┘       └──┬─────┬──┘
+                            │                      │                   │STRESS│LIFE
+                            │ CH INSERT            │ CAVITATION        ↓     ↓
+                            ↓                      ↓              ┌─────────────┐
+                    ┌───────────────┐      ┌───────────────┐      │ alarm_      │
+                    │  ClickHouse   │      │  alarm_       │←─────│ pusher      │
+                    │  (TTL+归档)   │      │  pusher       │ALARM→│  IEC61850→  │
+                    └───────────────┘      └───────┬───────┘      └─────────────┘
+                                                   │                     │
+                                                   ↓ CAV+LIFE+ALARM     ↓
+                                            ┌──────────────┐     ┌──────────┐
+                                            │ api_gateway   │     │ IEC 61850│
+                                            │ (REST聚合)    │     │ Simulator│
+                                            └──────┬───────┘     └──────────┘
+                                                   │
+                                            ┌──────┴───────┐
+                                            │   Nginx      │
+                                            │  (Gzip+反代) │
+                                            └──────┬───────┘
+                                                   │
+                              ┌────────────────────┬┴───────────────────┐
+                              ↓                    ↓                     ↓
+                    ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+                    │ turbine_3d_     │  │ blade_detail    │  │ waterfall_      │
+                    │ viewer.js       │  │ .js             │  │ chart.js        │
+                    │ (WebGL云图)     │  │ (叶片面板)      │  │ (频谱瀑布)      │
+                    └─────────────────┘  └─────────────────┘  └─────────────────┘
 ```
 
-## 主要功能
+### IPC 数据流 (共享内存无锁队列)
 
-### 1. 数据采集与传输
-- 支持6台混流式水轮机，每台12个水听器 + 8个加速度计
-- 1ms采样间隔，水听器51.2kHz采样率，加速度计25.6kHz采样率
-- UDP高速数据流传输，支持128采样点/包
-- 多线程接收与处理，无锁队列保证高性能
-
-### 2. 信号处理与特征提取
-- FFT频谱分析（FFTW3加速）
-- 小波包变换（db4小波，5级分解，32个频带）
-- 频谱特征提取：峰值频率、RMS值、峰值因子、峭度、偏度、谱质心等
-- 小波包特征：各频带能量、能量比、能量熵
-
-### 3. 空化状态在线识别
-- **孤立森林算法**：100棵树，子采样256个样本，基于路径长度计算异常分数
-- **深度自编码器**：32维输入→16维隐藏→8维编码，基于重构误差检测异常
-- **集成学习**：两种模型加权平均，提高检测准确率
-- 空化阶段分类：正常(<0.3)、初生(0.3-0.6)、临界(0.6-0.8)、发展(>0.8)
-
-### 4. 叶片疲劳寿命评估
-- **雨流计数法**：四点法识别应力循环
-- **Goodman修正**：考虑平均应力对疲劳寿命的影响
-- **Miner线性累积损伤理论**：D = Σ(ni/Ni)
-- 剩余寿命估算：基于历史损伤速率预测
-
-### 5. 告警系统
-- 空化强度超限告警
-- 叶片振动超标告警
-- 寿命预警
-- IEC 61850协议推送至监控系统
-- 智能检修建议生成
-- 告警抑制与确认机制
-
-### 6. 可视化前端
-- **WebGL水轮机剖面图**：蜗壳、导叶、转轮、尾水管三维模型
-- **空化强度云图**：颜色映射叠加在转轮叶片上
-- **瀑布图**：噪声频谱实时滚动显示
-- **交互功能**：点击叶片查看历史趋势和损伤详情
-- **告警面板**：实时告警展示与管理
+| 通道 | 生产者 | 消费者 | 消息类型 |
+|------|--------|--------|----------|
+| RAW_DATA (0) | pxi_collector | cavitation_detector, fatigue_evaluator | IPCMessageRaw (128点波形) |
+| FEATURES (1) | pxi_collector | cavitation_detector | IPCMessageFeatures (谱+小波) |
+| CAVITATION (2) | cavitation_detector | fatigue_evaluator, alarm_pusher, api_gateway | IPCMessageCavitation |
+| STRESS (3) | fatigue_evaluator | alarm_pusher | IPCMessageStress |
+| LIFE (4) | fatigue_evaluator | alarm_pusher, api_gateway | IPCMessageLife |
+| ALARM (5) | alarm_pusher | api_gateway | IPCMessageAlarm |
 
 ## 目录结构
 
 ```
-AI_solo_coder_task_A_041/
-├── backend/                    # C++后端代码
-│   ├── include/                # 头文件
-│   │   ├── config.h            # 配置管理
-│   │   ├── data_structures.h   # 数据结构定义
-│   │   ├── udp_server.h        # UDP服务器
-│   │   ├── clickhouse_client.h # ClickHouse客户端
-│   │   ├── signal_processor.h  # 信号处理器
-│   │   ├── cavitation_detector.h  # 空化检测器
-│   │   ├── life_assessor.h     # 寿命评估器
-│   │   ├── alarm_manager.h     # 告警管理器
-│   │   ├── api_server.h        # API服务器
-│   │   └── data_pipeline.h     # 数据管道
-│   ├── src/                    # 源文件
-│   │   ├── main.cpp            # 主程序入口
-│   │   ├── config.cpp
-│   │   ├── udp_server.cpp
-│   │   ├── clickhouse_client.cpp
-│   │   ├── signal_processor.cpp
-│   │   ├── cavitation_detector.cpp
-│   │   ├── life_assessor.cpp
-│   │   ├── alarm_manager.cpp
-│   │   ├── api_server.cpp
-│   │   └── data_pipeline.cpp
-│   └── CMakeLists.txt          # 构建配置
-├── frontend/                   # 前端代码
-│   ├── index.html              # 主页面
-│   ├── css/
-│   │   └── style.css           # 样式文件
-│   └── js/
-│       ├── turbine_viewer.js   # WebGL水轮机视图
-│       ├── waterfall_chart.js  # 瀑布图组件
-│       └── main.js             # 主逻辑
-├── simulator/                  # 模拟器
-│   └── pxi_simulator.py        # PXI采集模拟器
-├── clickhouse/                 # 数据库
-│   └── init.sql                # 初始化脚本
-├── config/                     # 配置文件
-│   └── config.json             # 系统配置
-└── README.md                   # 本文件
+.
+├── backend/
+│   ├── common/include/          # 共享库
+│   │   ├── ipc_queue.h          # 共享内存SPSC队列 + 6种IPC消息
+│   │   ├── service_base.h       # 服务生命周期基类
+│   │   └── metrics.h            # spdlog + Prometheus指标
+│   ├── include/                 # 算法头文件
+│   ├── src/                     # 算法实现
+│   ├── services/                # 微服务入口
+│   │   ├── pxi_collector/       # UDP采集 + FFT/小波特征
+│   │   ├── cavitation_detector/ # AE/IF + 工况归一化 + 自适应阈值
+│   │   ├── fatigue_evaluator/   # 四点法雨流 + Goodman + Miner
+│   │   ├── alarm_pusher/        # 4级告警 + 10s去抖 + IEC61850
+│   │   └── api_gateway/         # REST API聚合
+│   └── CMakeLists.txt           # 多target编译
+├── frontend/
+│   ├── js/
+│   │   ├── turbine_3d_viewer.js # WebGL空化云图组件
+│   │   ├── blade_detail.js      # 叶片详情面板组件
+│   │   ├── waterfall_chart.js   # 瀑布图WebWorker组件
+│   │   └── main.js              # 前端主逻辑
+│   └── index.html
+├── simulator/
+│   ├── pxi_simulator.py         # PXI模拟器 v2.0 (空化注入)
+│   └── iec61850_simulator.py    # IEC 61850网关模拟器
+├── clickhouse/
+│   ├── init.sql                 # 建表 + 物化视图 + 默认配置
+│   └── archive_policy.sql       # TTL + 冷热分离 + 聚合归档
+├── config/
+│   ├── config.json              # 系统配置
+│   └── models/                  # 外置模型参数
+│       ├── autoencoder.json     # 深度自编码器架构/权重/评估
+│       ├── isolation_forest.json # 孤立森林参数/特征/工况桶
+│       └── material_13Cr4Ni.json # 材料S-N曲线/Goodman/Miner
+├── docker/
+│   ├── docker-compose.yml       # 全栈编排
+│   ├── Dockerfile.cpp           # C++多阶段构建
+│   ├── Dockerfile.pxi_sim       # PXI模拟器
+│   ├── Dockerfile.iec61850      # IEC61850模拟器
+│   ├── Dockerfile.frontend      # Nginx + Gzip
+│   ├── nginx.conf               # Gzip + /api反代
+│   └── prometheus.yml           # Prometheus采集配置
+├── tests/
+│   ├── regression_runner.py     # 9项回归测试
+│   └── regression_report.json   # 测试报告
+└── start_services.bat           # Windows本地启动脚本
 ```
 
-## 快速开始
+## Docker 部署
 
-### 1. 环境要求
+### 前置要求
 
-**后端依赖：**
-- C++17 编译器 (GCC 7+ / Clang 5+ / MSVC 2017+)
-- CMake 3.10+
-- FFTW3 (可选，用于FFT加速)
-- libcurl (可选，用于ClickHouse HTTP接口)
-- jsoncpp (可选，用于JSON解析)
-- pthread (Linux) / WS2_32 (Windows)
+- Docker 20.10+
+- Docker Compose v2.0+
+- 8GB+ 可用内存
 
-**前端依赖：**
-- 现代浏览器（支持WebGL）
-- gl-matrix.js（已通过CDN引入）
-
-**数据库：**
-- ClickHouse 21.8+
-
-### 2. 数据库初始化
+### 一键启动
 
 ```bash
-# 启动ClickHouse服务
-clickhouse-server --config-file=/etc/clickhouse-server/config.xml &
+cd docker
+docker compose up -d
 
-# 执行初始化脚本
-clickhouse-client --multiquery < clickhouse/init.sql
+# 查看服务状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f pxi_collector
+docker compose logs -f cavitation_detector
 ```
 
-### 3. 后端编译
+### 逐服务启动顺序
+
+```bash
+# 1. 基础设施
+docker compose up -d clickhouse
+# 等待健康检查通过
+docker compose up -d iec61850_simulator
+
+# 2. C++微服务
+docker compose up -d pxi_collector
+docker compose up -d cavitation_detector
+docker compose up -d fatigue_evaluator
+docker compose up -d alarm_pusher
+docker compose up -d api_gateway
+
+# 3. 模拟器 + 前端
+docker compose up -d pxi_simulator
+docker compose up -d frontend
+
+# 4. 监控
+docker compose up -d prometheus grafana
+```
+
+### 服务端口映射
+
+| 服务 | 容器端口 | 主机端口 | 用途 |
+|------|----------|----------|------|
+| frontend (Nginx) | 80 | 80 | 前端 + /api反代 |
+| api_gateway | 8080 | 8080 | REST API |
+| pxi_collector | 9000/udp | 9001 | UDP数据接收 |
+| ClickHouse HTTP | 8123 | 8123 | 查询接口 |
+| ClickHouse Native | 9000 | 9000 | Native协议 |
+| IEC 61850 Sim | 8102 | 8102 | MMS模拟 |
+| Prometheus | 9090 | 9090 | 指标采集 |
+| Grafana | 3000 | 3000 | 监控面板 |
+| pxi_collector metrics | 9100 | 9101 | Prometheus pull |
+| cavitation_detector metrics | 9100 | 9102 | Prometheus pull |
+| fatigue_evaluator metrics | 9100 | 9103 | Prometheus pull |
+| alarm_pusher metrics | 9100 | 9104 | Prometheus pull |
+| api_gateway metrics | 9100 | 9105 | Prometheus pull |
+
+### 停止与清理
+
+```bash
+docker compose down              # 停止所有容器
+docker compose down -v           # 停止并删除数据卷
+docker compose down --rmi all    # 停止并删除镜像
+```
+
+## PXI 模拟器用法
+
+### 基本用法
+
+```bash
+# 所有水轮机正常运行
+python simulator/pxi_simulator.py -H 127.0.0.1 -p 9000
+
+# Docker 内运行 (自动连接 pxi_collector)
+docker compose up pxi_simulator
+```
+
+### 注入空化特征信号
+
+模拟器支持按水轮机编号注入不同阶段的空化特征：
+
+```bash
+# 2号机初生空化, 4号机临界空化
+python simulator/pxi_simulator.py -H 127.0.0.1 -p 9000 \
+    --inject-cavitation 2:incipient 4:critical
+
+# 混合注入: 1号机初生, 3号机临界, 5号机发展
+python simulator/pxi_simulator.py \
+    --inject-cavitation 1:incipient,3:critical,5:developed
+
+# 也支持数字编码: 0=normal 1=incipient 2=critical 3=developed
+python simulator/pxi_simulator.py \
+    --inject-cavitation 2:3 4:2
+```
+
+### 空化阶段特征
+
+| 阶段 | 水听器特征 | 加速度计特征 | 信号注入细节 |
+|------|-----------|-------------|-------------|
+| normal (0) | 背景噪声 0.3 | 轴频谐波 | 仅环境噪声 |
+| incipient (1) | 5-15kHz 宽带噪声 | 微弱冲击 | noise=0.8, 1次冲击/帧 |
+| critical (2) | 15-30kHz 强噪声 | 密集冲击脉冲 | noise=2.0, 4次冲击, BPF调制 |
+| developed (3) | 全频段 5-45kHz | 高强度冲击 | noise=5.0, 10次冲击, 谐波畸变0.35 |
+
+空化阶段转换采用渐进插值（每0.5秒步进），模拟真实工况渐变过程。
+
+### 模拟器参数
+
+```
+-H, --host           目标主机 (默认 127.0.0.1)
+-p, --port           目标端口 (默认 9000)
+-i, --interval       发送间隔秒 (默认 0.001)
+--inject-cavitation  注入规格 TURBINE:STAGE
+```
+
+## IEC 61850 模拟器用法
+
+```bash
+# 本地运行
+python simulator/iec61850_simulator.py --port 8102
+
+# Docker 运行
+docker compose up iec61850_simulator
+```
+
+### API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | /mms/report | 接收告警报告 |
+| POST | /mms/associate | MMS关联请求 |
+| GET | /mms/status | 网关状态+统计 |
+| GET | /mms/alarms | 告警历史 |
+
+## ClickHouse 数据管理
+
+### TTL 策略
+
+| 表 | 热存储 | 冷存储 | 删除 |
+|----|--------|--------|------|
+| raw_sensor_data | 7天 | 7-30天 | 30天 |
+| spectrum_features | 30天 | 30-90天 | 90天 |
+| wavelet_features | 30天 | 30-90天 | 90天 |
+| cavitation_state | 90天 | 90-365天 | 1年 |
+| blade_stress | 90天 | 90-365天 | 1年 |
+| life_assessment | 365天 | 1-5年 | 5年 |
+| alarm_logs | - | - | 2年 |
+
+### 自动归档物化视图
+
+| 视图 | 源表 | 目标表 | 聚合粒度 |
+|------|------|--------|----------|
+| cavitation_intensity_1s | cavitation_state | cavitation_intensity_1s_table | 1秒 |
+| cavitation_intensity_1h_mv | cavitation_intensity_1s_table | cavitation_intensity_1h | 1小时 |
+| cavitation_damage_daily | life_assessment | cavitation_damage_daily_table | 1天 |
+| blade_damage_daily_mv | blade_stress | blade_damage_daily | 1天 |
+| alarm_stats_daily_mv | alarm_logs | alarm_stats_daily | 1天 |
+
+## C++ 微服务构建
+
+### 依赖
+
+- C++17 编译器 (GCC 9+ / Clang 10+ / MSVC 2019+)
+- CMake 3.14+
+- FFTW3
+- spdlog 1.14+
+- prometheus-cpp 1.2+
+- nlohmann/json
+- ClickHouse C++ Client (可选)
+- pthread / WS2_32
+
+### 编译
 
 ```bash
 cd backend
 mkdir build && cd build
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 运行
-./turbine_monitor -c ../../config/config.json
+# 产出 7 个 target:
+#   bin/pxi_collector/pxi_collector
+#   bin/cavitation_detector/cavitation_detector
+#   bin/fatigue_evaluator/fatigue_evaluator
+#   bin/alarm_pusher/alarm_pusher
+#   bin/api_gateway/api_gateway
+#   bin/turbine_monitor          (兼容单体)
+#   bin/pxi_simulator            (C++版)
 ```
 
-### 4. 启动模拟器
+### Prometheus 指标
+
+每个服务在 `:9100/metrics` 暴露以下指标族：
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| turbine_packets_total | Counter | 处理数据包总数 |
+| turbine_packets_dropped_total | Counter | 丢包数 |
+| turbine_ipc_sent_total | Counter | IPC发送数 |
+| turbine_ipc_received_total | Counter | IPC接收数 |
+| turbine_cavitation_detected_total | Counter | 空化检测(按阶段) |
+| turbine_alarms_total | Counter | 告警(按级别) |
+| turbine_blade_cumulative_damage | Gauge | 叶片累计损伤 |
+| turbine_blade_remaining_life_hours | Gauge | 叶片剩余寿命 |
+| turbine_processing_latency_seconds | Histogram | 处理延迟直方图 |
+| turbine_clickhouse_inserts_total | Counter | ClickHouse写入数 |
+| turbine_clickhouse_errors_total | Counter | ClickHouse错误数 |
+
+## 前端
+
+### Gzip 压缩
+
+Nginx 对以下类型启用 Gzip (压缩级别 6):
+
+- text/plain, text/css, text/xml, text/javascript
+- application/javascript, application/json, application/xml
+- image/svg+xml, font/woff, font/woff2
+
+最小压缩阈值 256 字节，缓存 7 天静态资源。
+
+### 组件
+
+| 文件 | 类 | 职责 |
+|------|-----|------|
+| turbine_3d_viewer.js | Turbine3DViewer | WebGL剖面+空化云图+hover/select回调 |
+| blade_detail.js | BladeDetailPanel | 模态框+趋势图+寿命仪表盘+操作按钮 |
+| waterfall_chart.js | WaterfallWorker | OffscreenCanvas+分块降采样频谱瀑布 |
+
+## 回归测试
 
 ```bash
-cd simulator
-pip install numpy
-python3 pxi_simulator.py -H 127.0.0.1 -p 9000
+$env:PYTHONIOENCODING='utf-8'
+python tests/regression_runner.py [--quick] [--verbose]
 ```
 
-### 5. 启动前端
+9 项测试覆盖: IPC队列、UDP丢包率、工况归一化、雨流计数、告警去抖、模型配置、前端拆分、服务源码、CMake target。
 
-```bash
-cd frontend
-python3 -m http.server 8000
-
-# 浏览器访问 http://localhost:8000
-```
-
-## 核心技术指标
+## 技术指标
 
 | 指标 | 数值 |
 |------|------|
-| 监测机组数 | 6台 |
-| 每台水听器 | 12个 |
-| 每台加速度计 | 8个 |
-| 采样率（水听器） | 51.2 kHz |
-| 采样率（加速度计） | 25.6 kHz |
+| 监测机组 | 6台混流式水轮机 |
+| 传感器/机 | 12水听器 + 8加速度计 = 20 |
+| 采样率(水听器) | 51.2 kHz |
+| 采样率(加速度计) | 25.6 kHz |
 | 上报间隔 | 1 ms |
 | 数据包速率 | 120,000 包/秒 |
-| 数据吞吐量 | ~120 Mbps |
-| 处理延迟 | < 10 ms |
-| 叶片数/每台 | 15个 |
-
-## ClickHouse 表结构
-
-系统设计了11张核心表和2个物化视图：
-
-- `raw_sensor_data` - 原始传感器数据（TTL 30天）
-- `spectrum_features` - 频谱特征（TTL 90天）
-- `wavelet_features` - 小波包特征（TTL 90天）
-- `cavitation_state` - 空化状态识别结果（TTL 1年）
-- `blade_stress` - 叶片应力计算结果（TTL 1年）
-- `life_assessment` - 寿命评估结果（TTL 3年）
-- `alarm_logs` - 告警记录（TTL 3年）
-- `turbine_config` - 水轮机配置
-- `sensor_config` - 传感器配置
-- `cavitation_intensity_1s_table` - 1秒聚合（物化视图）
-- `cavitation_damage_daily_table` - 日损伤累计（物化视图）
-
-## API 接口
-
-| 接口 | 方法 | 描述 |
-|------|------|------|
-| `/api/turbines` | GET | 获取所有水轮机列表 |
-| `/api/turbine/detail` | GET | 获取水轮机详情 |
-| `/api/cavitation` | GET | 获取空化状态数据 |
-| `/api/life` | GET | 获取寿命评估数据 |
-| `/api/spectrum` | GET | 获取频谱数据 |
-| `/api/waterfall` | GET | 获取瀑布图数据 |
-| `/api/alarms/active` | GET | 获取活跃告警 |
-| `/api/alarms/acknowledge` | POST | 确认告警 |
-| `/api/alarms/suppress` | POST | 抑制告警 |
-| `/api/status` | GET | 获取系统状态 |
-
-## 关键算法
-
-### 空化检测算法
-
-```
-异常分数 = 0.5 * IF_score + 0.5 * AE_reconstruction_error
-
-IF_score = 2^(-avgPathLength / cFactor(n))
-AE_error = MSE(original, reconstructed)
-
-阈值分类:
-  < 0.3 → 正常
-0.3-0.6 → 初生空化
-0.6-0.8 → 临界空化
-  > 0.8 → 发展空化
-```
-
-### 寿命评估算法
-
-```
-雨流计数 → 应力循环识别
-Goodman修正 → σ_a' = σ_a / (1 - σ_m / σ_uts)
-Miner损伤 → D = Σ(ni / Ni)
-Ni = k * (Δσ)^(-m)
-剩余寿命 = (1 - D) / (dD/dt)
-```
-
-## 性能优化
-
-1. **多线程架构**：1个接收线程 + 8个处理线程
-2. **无锁队列**：TBB并发队列实现高效数据传递
-3. **批量写入**：ClickHouse批量1000条或1秒自动刷新
-4. **FFTW3加速**：快速傅里叶变换性能优化
-5. **SIMD指令**：编译器自动向量化
-6. **内存池**：减少内存分配开销
-7. **TTL策略**：自动清理过期数据
-8. **物化视图**：预聚合常用查询
-
-## 监控与运维
-
-系统提供完整的运行状态监控：
-- 实时统计：接收包数、处理包数、队列长度、处理延迟
-- 日志分级：DEBUG/INFO/WARNING/ERROR
-- 健康检查接口：`/api/status`
-- 内置性能计数器
-
-## 扩展计划
-
-- [ ] 支持更多传感器类型（压力、温度等）
-- [ ] 深度学习模型在线训练
-- [ ] 数字孪生集成
-- [ ] 多电站集中监控
-- [ ] 移动端APP
-- [ ] 边缘计算节点支持
-
-## 技术支持
-
-如有问题，请联系系统运维团队。
+| UDP丢包率 | <0.1% (recvmmsg+SPSC) |
+| 工况误报率 | <3% (Z-Score分桶+自适应阈值) |
+| 雨流内存/叶 | <4 KB (流式四点法) |
+| 瀑布图主线程 | <2ms (WebWorker+分块) |
+| 叶片数/台 | 15 |
+| IEC 61850去抖 | 10秒冷却窗口 |
 
 ---
 
-**版本**: 1.0.0  
-**更新日期**: 2026-06-10  
+**版本**: 2.0.0 (微服务化 + Docker编排)
+**更新日期**: 2026-06-10
 **适用场景**: 大型混流式水轮机组空化监测与寿命评估
